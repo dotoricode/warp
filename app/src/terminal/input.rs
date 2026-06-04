@@ -3699,21 +3699,33 @@ impl Input {
                 conversation_id,
                 query_id,
                 text,
+                is_command,
             } => {
-                self.submit_queued_prompt_for_active_pane(
-                    text.clone(),
-                    *conversation_id,
-                    *query_id,
-                    ctx,
-                );
+                let dispatched = if *is_command {
+                    self.execute_queued_command(text, *conversation_id, ctx)
+                } else {
+                    self.submit_queued_prompt_for_active_pane(
+                        text.clone(),
+                        *conversation_id,
+                        *query_id,
+                        ctx,
+                    );
+                    true
+                };
+                if !dispatched {
+                    return;
+                }
                 QueuedQueryModel::handle(ctx).update(ctx, |model, ctx| {
                     model.remove_fired_row(*conversation_id, *query_id, ctx);
                 });
                 self.focus_input_box(ctx);
             }
-            QueuedPromptsPanelEvent::RowDeleted { text } => {
+            QueuedPromptsPanelEvent::RowDeleted { text, is_command } => {
                 if self.buffer_text(ctx).is_empty() {
                     self.replace_buffer_content(text, ctx);
+                    if *is_command {
+                        self.set_input_mode_terminal(/* steal_focus */ false, ctx);
+                    }
                 }
                 self.focus_input_box(ctx);
             }
@@ -6888,6 +6900,23 @@ impl Input {
         } else {
             self.try_execute_command_from_source(command, CommandExecutionSource::User, ctx)
         }
+    }
+
+    /// Executes a command drained or sent immediately from the queued-prompts panel and keeps the
+    /// remaining queue paused until the command's terminal block finishes.
+    pub(crate) fn execute_queued_command(
+        &mut self,
+        command: &str,
+        conversation_id: AIConversationId,
+        ctx: &mut ViewContext<Self>,
+    ) -> bool {
+        let started = self.try_execute_command(command, ctx);
+        if started {
+            QueuedQueryModel::handle(ctx).update(ctx, |model, _| {
+                model.arm_command_in_flight(conversation_id);
+            });
+        }
+        started
     }
 
     /// Executes the given command if the terminal session is in a valid state to accept and
