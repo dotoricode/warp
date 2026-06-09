@@ -6,6 +6,7 @@ use futures::TryStreamExt;
 use warp_core::channel::ChannelState;
 use warp_core::ui::icons::Icon;
 use warp_core::{report_error, safe_warn};
+use warp_util::host_id::HostId;
 use warp_util::local_or_remote_path::LocalOrRemotePath;
 use warpui::{AppContext, SingletonEntity};
 
@@ -37,7 +38,116 @@ impl BundledSkillActivation {
     }
 }
 
-/// A bundled skill definition with its activation condition and icon.
+/// Catalogs of bundled skills for the local host and connected remote hosts.
+#[derive(Debug, Default)]
+pub struct BundledSkills {
+    local: BundledSkill,
+    remote_by_host: HashMap<HostId, RemoteBundledSkillState>,
+    next_remote_generation: u64,
+}
+
+#[derive(Debug)]
+enum RemoteBundledSkillState {
+    Bootstrapping { generation: u64 },
+    Ready(BundledSkill),
+}
+
+/// Identifies one in-flight remote bundled-skill bootstrap.
+///
+/// Generations prevent a bootstrap that completed after a disconnect from
+/// replacing a newer catalog created after the same host reconnects.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub(super) struct RemoteBundledSkillBootstrap {
+    host_id: HostId,
+    generation: u64,
+}
+
+impl BundledSkills {
+    pub fn set_local(&mut self, bundled_skill: BundledSkill) {
+        self.local = bundled_skill;
+    }
+
+    pub fn local(&self) -> &BundledSkill {
+        &self.local
+    }
+
+    /// Begins bootstrapping a catalog for a newly connected remote host.
+    ///
+    /// Returns `None` when the host is already bootstrapping or ready, so
+    /// duplicate host-connected signals do not rebuild its catalog.
+    pub fn begin_remote_bootstrap(
+        &mut self,
+        host_id: HostId,
+    ) -> Option<RemoteBundledSkillBootstrap> {
+        if self.remote_by_host.contains_key(&host_id) {
+            return None;
+        }
+
+        self.next_remote_generation = self.next_remote_generation.wrapping_add(1);
+        let bootstrap = RemoteBundledSkillBootstrap {
+            host_id: host_id.clone(),
+            generation: self.next_remote_generation,
+        };
+        self.remote_by_host.insert(
+            host_id,
+            RemoteBundledSkillState::Bootstrapping {
+                generation: bootstrap.generation,
+            },
+        );
+        Some(bootstrap)
+    }
+
+    /// Installs a completed remote catalog if it belongs to the current bootstrap.
+    ///
+    /// Returns `false` for stale completions whose host disconnected or began a
+    /// newer bootstrap before this one completed.
+    pub fn complete_remote_bootstrap(
+        &mut self,
+        bootstrap: RemoteBundledSkillBootstrap,
+        bundled_skill: BundledSkill,
+    ) -> bool {
+        let is_current_bootstrap = matches!(
+            self.remote_by_host.get(&bootstrap.host_id),
+            Some(RemoteBundledSkillState::Bootstrapping { generation })
+                if *generation == bootstrap.generation
+        );
+        if !is_current_bootstrap {
+            return false;
+        }
+
+        let host_id = bootstrap.host_id;
+        self.remote_by_host.insert(
+            host_id.clone(),
+            RemoteBundledSkillState::Ready(bundled_skill),
+        );
+        self.remote(&host_id).is_some()
+    }
+
+    /// Removes all catalog state for a disconnected remote host.
+    pub fn remove_remote(&mut self, host_id: &HostId) {
+        self.remote_by_host.remove(host_id);
+    }
+
+    /// Returns the ready catalog for a connected remote host.
+    pub fn remote(&self, host_id: &HostId) -> Option<&BundledSkill> {
+        match self.remote_by_host.get(host_id) {
+            Some(RemoteBundledSkillState::Ready(bundled_skill)) => Some(bundled_skill),
+            Some(RemoteBundledSkillState::Bootstrapping { .. }) | None => None,
+        }
+    }
+
+    #[cfg(test)]
+    pub fn insert_local_for_testing(
+        &mut self,
+        id: impl Into<String>,
+        skill: ParsedSkill,
+        activation: BundledSkillActivation,
+    ) {
+        self.local.insert_for_testing(id, skill, activation);
+    }
+}
+
+/// One bundled skill definition with its activation condition and icon.
 #[derive(Debug, Clone)]
 struct BundledSkillDefinition {
     skill: ParsedSkill,
@@ -274,3 +384,7 @@ fn activation_for_bundled_skill(skill_id: &str, resources_dir: &Path) -> Bundled
         _ => BundledSkillActivation::Always,
     }
 }
+
+#[cfg(test)]
+#[path = "bundled_tests.rs"]
+mod tests;

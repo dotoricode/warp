@@ -2128,6 +2128,11 @@ impl RemoteServerManager {
         self.host_to_sessions.get(host_id)
     }
 
+    /// Returns all host IDs with at least one connected session.
+    pub fn connected_host_ids(&self) -> impl Iterator<Item = &HostId> {
+        self.host_to_sessions.keys()
+    }
+
     fn connected_session_for_host(
         &self,
         host_id: &HostId,
